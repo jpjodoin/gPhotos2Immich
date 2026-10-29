@@ -128,6 +128,16 @@
         .progress-bar-bg { width: 100%; background-color: #ddd; border-radius: 4px; height: 20px; overflow: hidden; margin-top: 10px; }
         .progress-bar-fill { height: 100%; background-color: var(--success-color); width: 0%; transition: width 0.3s; }
         .status-text { font-size: 14px; margin-top: 5px; }
+        .badge { display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; color: #fff; background: #9aa0a6; }
+        .badge.success { background: var(--success-color); }
+        .badge.partial { background: #f0ad4e; }
+        .badge.error { background: var(--danger-color); }
+        .badge.running { background: var(--primary-color); }
+        .badge.idle { background: #9aa0a6; }
+        .counts { font-size: 11px; color: #555; margin-top: 3px; white-space: nowrap; }
+        .btn-small { padding: 4px 8px; font-size: 12px; margin: 0 4px 0 0; }
+        .container { max-width: 1120px; }
+        .debt-dry-run { background: #fff3cd; border: 1px solid #ffe08a; color: #7a5b00; padding: 8px; border-radius: 4px; font-size: 12px; margin-top: 8px; }
 
     </style>
 </head>
@@ -156,9 +166,11 @@
                         <table id="albumsTable">
                             <thead>
                                 <tr>
+                                    <th title="Sync this album">On</th>
                                     <th>URL</th>
                                     <th>Album Name</th>
-                                    <th>Sync Interval</th>
+                                    <th>Interval</th>
+                                    <th>Last sync</th>
                                     <th>Action</th>
                                 </tr>
                             </thead>
@@ -181,6 +193,16 @@
                         <div class="status-text" id="statusNextRun" style="font-size: 12px; color: #666;">Next Run: Pending</div>
                         <button type="button" class="btn" style="margin-top: 10px; width: 100%;" onclick="triggerSync()">Sync Now</button>
                     </div>
+
+                    <div class="status-container" id="dedupPanel">
+                        <h3>Duplicate tracker</h3>
+                        <div class="status-text" id="debtPending">Pending debts: 0</div>
+                        <div class="status-text" id="debtResolved">Resolved: 0</div>
+                        <div class="status-text" id="debtExpired">Expired: 0</div>
+                        <div class="status-text" id="debtMode" style="font-size: 12px; color: #666;">Mode: unknown</div>
+                        <div class="debt-dry-run" id="debtDryRun" style="display: none;">DRY RUN — nothing is written to Immich</div>
+                        <button type="button" class="btn" style="margin-top: 10px; width: 100%;" onclick="triggerReconcile()">Reconcile now</button>
+                    </div>
                 </div>
             </div>
 
@@ -192,6 +214,21 @@
                 <label for="apiKey">Immich API Key</label>
                 <input type="password" id="apiKey" name="apiKey" required placeholder="Your Immich API Key">
                 
+                <h2>Duplicate handling</h2>
+                <label class="flex-row">
+                    <input type="checkbox" id="dryRun"> Dry run (match and log only, write nothing to Immich)
+                </label>
+
+                <label for="similarityThreshold">Similarity threshold (0-32, default 14)</label>
+                <input type="number" id="similarityThreshold" min="0" max="32" value="14">
+
+                <label for="ambiguityMargin">Ambiguity margin (default 4)</label>
+                <input type="number" id="ambiguityMargin" min="0" max="32" value="4">
+
+                <label class="flex-row">
+                    <input type="checkbox" id="deleteMatchedDuplicates"> Delete the duplicate once the original is found (requires asset.delete)
+                </label>
+
                 <h2>Logs</h2>
                 <button type="button" class="btn" onclick="refreshLogs()">Refresh Logs</button>
                 <textarea id="appLogs" readonly></textarea>
@@ -311,6 +348,9 @@
                 } else {
                     document.getElementById('statusNextRun').textContent = 'Next Run: Pending';
                 }
+
+                renderAlbumStatus(data.albums);
+                renderDebts(data);
             } catch (err) {
                 // Ignore silent errors during polling
             }
@@ -326,16 +366,26 @@
         // Initial poll right away
         pollStatus();
 
+        let loadedConfig = {};
+
         async function loadConfig() {
             try {
                 const res = await fetch('/api/config');
                 if (!res.ok) throw new Error('Failed to load');
                 const config = await res.json();
-                
+                loadedConfig = config;
+
                 document.getElementById('apiURL').value = config.apiURL || '';
                 document.getElementById('apiKey').value = config.apiKey || '';
                 document.getElementById('workers').value = config.workers || 1;
                 document.getElementById('debug').checked = config.debug || false;
+
+                const dedup = config.dedup || {};
+                const reconcile = config.reconcile || {};
+                document.getElementById('dryRun').checked = dedup.dryRun === true;
+                document.getElementById('similarityThreshold').value = dedup.similarityThreshold || 14;
+                document.getElementById('ambiguityMargin').value = dedup.ambiguityMargin || 4;
+                document.getElementById('deleteMatchedDuplicates').checked = reconcile.deleteMatchedDuplicates === true;
 
                 const tbody = document.querySelector('#albumsTable tbody');
                 tbody.innerHTML = '';
@@ -392,16 +442,109 @@
             saveConfig();
         }
 
-        function addAlbumRow(gp = {url: '', albumName: '', syncInterval: '120h'}) {
+        function addAlbumRow(gp = {url: '', albumName: '', syncInterval: '120h', enabled: true}) {
             const tbody = document.querySelector('#albumsTable tbody');
             const tr = document.createElement('tr');
+            const enabled = gp.enabled !== false;
+            tr.setAttribute('data-url', gp.url || '');
             tr.innerHTML = `
+                <td style="text-align:center;"><input type="checkbox" name="enabled" ${enabled ? 'checked' : ''} title="Sync this album"></td>
                 <td><input type="text" name="url" value="${escapeHtml(gp.url)}" placeholder="https://photos.app.goo.gl/..." required></td>
                 <td><input type="text" name="albumName" value="${escapeHtml(gp.albumName)}" placeholder="Album Name"></td>
-                <td><input type="text" name="syncInterval" value="${escapeHtml(gp.syncInterval)}" placeholder="12h" style="width: 80px;"></td>
-                <td><button type="button" class="btn btn-danger" onclick="this.closest('tr').remove()">Remove</button></td>
+                <td><input type="text" name="syncInterval" value="${escapeHtml(gp.syncInterval)}" placeholder="12h" style="width: 70px;"></td>
+                <td class="album-status"><span class="badge idle">never</span></td>
+                <td style="white-space:nowrap;">
+                    <button type="button" class="btn btn-small" onclick="syncAlbumRow(this)">Sync</button>
+                    <button type="button" class="btn btn-danger" onclick="this.closest('tr').remove()">Remove</button>
+                </td>
             `;
             tbody.appendChild(tr);
+        }
+
+        function fmtTime(value) {
+            if (!value) return 'never';
+            const d = new Date(value);
+            if (isNaN(d.getTime()) || d.getFullYear() < 2000) return 'never';
+            return d.toLocaleString();
+        }
+
+        function renderAlbumStatus(albums) {
+            const byUrl = {};
+            (albums || []).forEach(a => { byUrl[a.url] = a; });
+
+            document.querySelectorAll('#albumsTable tbody tr').forEach(tr => {
+                const cell = tr.querySelector('.album-status');
+                if (!cell) return;
+                const url = tr.getAttribute('data-url') || tr.querySelector('input[name="url"]').value;
+                const st = byUrl[url];
+                if (!st) {
+                    cell.innerHTML = '<span class="badge idle">never</span>';
+                    cell.title = 'Not synced yet';
+                    return;
+                }
+                const c = st.counts || {};
+                const parts = [];
+                parts.push('matched ' + (c.matched || 0));
+                parts.push('uploaded ' + (c.uploaded || 0));
+                if (c.wouldUpload) parts.push('would upload ' + c.wouldUpload);
+                if (c.skipped) parts.push('skipped ' + c.skipped);
+                if (c.failed) parts.push('failed ' + c.failed);
+                if (c.ambiguous) parts.push('ambiguous ' + c.ambiguous);
+
+                const label = st.result === 'success' ? 'ok' : st.result;
+                cell.innerHTML = `<span class="badge ${st.result}">${label}</span><div class="counts">${parts.join(' · ')}</div>`;
+                cell.title = 'Last run: ' + fmtTime(st.lastRun) + ' (' + (st.durationMs || 0) + ' ms)\nNext run: ' + fmtTime(st.nextRun) + (st.lastError ? '\nError: ' + st.lastError : '');
+            });
+        }
+
+        function renderDebts(data) {
+            const debts = data.debts || {};
+            document.getElementById('debtPending').textContent = 'Pending debts: ' + (debts.pending || 0);
+            document.getElementById('debtResolved').textContent = 'Resolved: ' + (debts.resolved || 0);
+            document.getElementById('debtExpired').textContent = 'Expired: ' + (debts.expired || 0);
+
+            const rec = data.reconcile || {};
+            const modeEl = document.getElementById('debtMode');
+            modeEl.textContent = rec.enabled ? ('Mode: active (every ' + (rec.interval || '?') + ')') : 'Mode: disabled';
+            document.getElementById('debtDryRun').style.display = rec.dryRun ? 'block' : 'none';
+        }
+
+        async function syncAlbumRow(button) {
+            const row = button.closest('tr');
+            const url = row.querySelector('input[name="url"]').value;
+            if (!url) {
+                alert('Set the album URL first, then save the configuration.');
+                return;
+            }
+            try {
+                const res = await fetch('/api/sync?album=' + encodeURIComponent(url), { method: 'POST' });
+                if (!res.ok) throw new Error('Failed to trigger sync');
+                const toast = document.getElementById('toast');
+                toast.textContent = 'Album sync triggered!';
+                toast.style.display = 'block';
+                setTimeout(() => {
+                    toast.style.display = 'none';
+                    toast.textContent = 'Saved successfully!';
+                }, 3000);
+            } catch (err) {
+                alert('Error triggering album sync: ' + err.message);
+            }
+        }
+
+        async function triggerReconcile() {
+            try {
+                const res = await fetch('/api/reconcile', { method: 'POST' });
+                if (!res.ok) throw new Error('Failed to trigger reconciliation');
+                const toast = document.getElementById('toast');
+                toast.textContent = 'Reconciliation triggered!';
+                toast.style.display = 'block';
+                setTimeout(() => {
+                    toast.style.display = 'none';
+                    toast.textContent = 'Saved successfully!';
+                }, 3000);
+            } catch (err) {
+                alert('Error triggering reconciliation: ' + err.message);
+            }
         }
 
         async function saveConfig() {
@@ -416,12 +559,25 @@
                 googlePhotos: []
             };
 
+            // Merge with the loaded config so options not exposed in the UI
+            // (intervals, backoff, paths) are preserved.
+            config.dedup = Object.assign({}, loadedConfig.dedup || {}, {
+                mode: (loadedConfig.dedup && loadedConfig.dedup.mode) || 'smart',
+                dryRun: document.getElementById('dryRun').checked,
+                similarityThreshold: parseInt(document.getElementById('similarityThreshold').value, 10) || 14,
+                ambiguityMargin: parseInt(document.getElementById('ambiguityMargin').value, 10) || 4
+            });
+            config.reconcile = Object.assign({}, loadedConfig.reconcile || {}, {
+                deleteMatchedDuplicates: document.getElementById('deleteMatchedDuplicates').checked
+            });
+
             const rows = document.querySelectorAll('#albumsTable tbody tr');
             rows.forEach(row => {
                 config.googlePhotos.push({
                     url: row.querySelector('input[name="url"]').value,
                     albumName: row.querySelector('input[name="albumName"]').value,
-                    syncInterval: row.querySelector('input[name="syncInterval"]').value
+                    syncInterval: row.querySelector('input[name="syncInterval"]').value,
+                    enabled: row.querySelector('input[name="enabled"]').checked
                 });
             });
 

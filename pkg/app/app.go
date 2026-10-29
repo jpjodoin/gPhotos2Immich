@@ -19,6 +19,7 @@ import (
 	"warreth.dev/gphotos2immich/pkg/progress"
 	"warreth.dev/gphotos2immich/pkg/reconcile"
 	"warreth.dev/gphotos2immich/pkg/state"
+	"warreth.dev/gphotos2immich/pkg/status"
 	"warreth.dev/gphotos2immich/pkg/util"
 )
 
@@ -30,8 +31,10 @@ type App struct {
 	State       *state.SyncState
 	Ledger      *ledger.Store
 	Reconciler  *reconcile.Reconciler
+	Status      *status.Store
 	backoff     []time.Duration
 	syncCh      chan struct{}
+	syncAlbumCh chan string
 	reconcileCh chan struct{}
 }
 
@@ -95,7 +98,12 @@ func New(cfg *config.Config) (*App, error) {
 		ReportPath:              cfg.Reconcile.ReportPath,
 	}, client, ledgerStore, syncState, logger)
 
-	return &App{
+	statusStore, err := status.Open(filepath.Join(dataDir, "sync-status.json"))
+	if err != nil {
+		return nil, fmt.Errorf("open status store: %w", err)
+	}
+
+	application := &App{
 		Cfg:         cfg,
 		Client:      client,
 		GPClient:    gpClient,
@@ -103,10 +111,16 @@ func New(cfg *config.Config) (*App, error) {
 		State:       syncState,
 		Ledger:      ledgerStore,
 		Reconciler:  reconciler,
+		Status:      statusStore,
 		backoff:     backoff,
 		syncCh:      make(chan struct{}, 1),
+		syncAlbumCh: make(chan string, 1),
 		reconcileCh: make(chan struct{}, 1),
-	}, nil
+	}
+	for _, ac := range cfg.GooglePhotos {
+		application.Status.Ensure(ac.URL, ac.AlbumName, ac.IsEnabled())
+	}
+	return application, nil
 }
 
 func mustDuration(value string) time.Duration {
@@ -148,6 +162,35 @@ func (a *App) TriggerReconcile() {
 	}
 }
 
+// TriggerAlbumSync requests an immediate sync of a single album.
+func (a *App) TriggerAlbumSync(url string) {
+	if url == "" {
+		return
+	}
+	select {
+	case a.syncAlbumCh <- url:
+	default:
+	}
+}
+
+// StatusPayload is the JSON shape consumed by the web UI.
+func (a *App) StatusPayload() map[string]any {
+	counts := a.Ledger.Counts()
+	return map[string]any{
+		"albums": a.Status.Snapshot(),
+		"debts": map[string]int{
+			"pending":  counts[ledger.StatePending],
+			"resolved": counts[ledger.StateResolved],
+			"expired":  counts[ledger.StateExpired],
+		},
+		"reconcile": map[string]any{
+			"enabled":  a.Cfg.Reconcile.IsEnabled(),
+			"interval": a.Cfg.Reconcile.Interval,
+			"dryRun":   a.Cfg.Dedup.DryRun,
+		},
+	}
+}
+
 func (a *App) Run(ctx context.Context) error {
 	a.Logger.Info("Starting Immich Sync")
 
@@ -169,6 +212,8 @@ func (a *App) Run(ctx context.Context) error {
 	nowStart := time.Now()
 	for _, ac := range a.Cfg.GooglePhotos {
 		nextRun[ac.URL] = nowStart
+		a.Status.Ensure(ac.URL, ac.AlbumName, ac.IsEnabled())
+		a.Status.SetNextRun(ac.URL, nowStart)
 	}
 	progress.SetScheduleTimes(time.Time{}, nowStart)
 
@@ -240,6 +285,7 @@ func (a *App) Run(ctx context.Context) error {
 					interval = 24 * time.Hour
 				}
 				nextRun[ac.URL] = nowCompleted.Add(interval)
+				a.Status.SetNextRun(ac.URL, nextRun[ac.URL])
 				a.Logger.Info("Scheduled next sync", "album", ac.URL, "next_run", nextRun[ac.URL].Format("15:04:05"))
 			}
 			for _, nr := range nextRun {
@@ -262,6 +308,11 @@ func (a *App) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			a.Logger.Info("Shutdown requested, stopping sync loop")
 			return nil
+		case url := <-a.syncAlbumCh:
+			if _, ok := nextRun[url]; ok {
+				a.Logger.Info("Sync triggered manually for one album", "album", url)
+				nextRun[url] = time.Now()
+			}
 		case <-a.syncCh:
 			a.Logger.Info("Sync triggered manually, running all albums immediately")
 			now := time.Now()
@@ -368,12 +419,14 @@ func (a *App) prefetchAlbumAssets(ctx context.Context, albumId string, logger *s
 }
 
 func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, albumCache []immich.Album, globalAssets map[string]string) {
+	started := time.Now()
 	logger := a.Logger.With("album_url", ac.URL)
 	logger.Info("Syncing Google Photos Album")
 
 	album, err := googlephotos.ScrapeAlbum(ctx, a.GPClient, ac.URL)
 	if err != nil {
 		logger.Error("Error scraping album", "error", err)
+		a.Status.MarkFinished(ac.URL, ac.AlbumName, status.Counts{}, err, time.Since(started))
 		return
 	}
 
@@ -382,9 +435,11 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 		albumTitle = ac.AlbumName
 	}
 	logger.Info("Found photos in album", "count", len(album.Photos), "title", albumTitle)
+	a.Status.MarkRunning(ac.URL, albumTitle)
 
 	if len(album.Photos) == 0 {
 		logger.Info("No photos found, skipping")
+		a.Status.MarkFinished(ac.URL, albumTitle, status.Counts{}, nil, time.Since(started))
 		return
 	}
 
@@ -518,6 +573,16 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 			logger.Warn("Failed to save dedup state", "error", err)
 		}
 	}
+
+	a.Status.MarkFinished(ac.URL, albumTitle, status.Counts{
+		Total:       processed,
+		Matched:     matched,
+		Uploaded:    uploaded,
+		WouldUpload: wouldUpload,
+		Skipped:     skipped,
+		Failed:      failed,
+		Ambiguous:   ambiguous,
+	}, nil, time.Since(started))
 
 	logger.Info("Album sync finished",
 		"total", processed,

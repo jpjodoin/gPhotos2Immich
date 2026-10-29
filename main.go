@@ -21,7 +21,7 @@ func main() {
 	os.Stdout = w
 	os.Stderr = w
 	log.SetOutput(w)
-	
+
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -73,6 +73,36 @@ func main() {
 			} else {
 				log.Println("Manual sync requested but application is not initialized yet.")
 			}
+		}
+		webUI.OnAlbumSync = func(url string) {
+			currentAppMu.RLock()
+			appl := currentApp
+			currentAppMu.RUnlock()
+
+			if appl != nil {
+				log.Printf("Manual sync requested for album %s.", url)
+				appl.TriggerAlbumSync(url)
+			}
+		}
+		webUI.OnReconcile = func() {
+			currentAppMu.RLock()
+			appl := currentApp
+			currentAppMu.RUnlock()
+
+			if appl != nil {
+				log.Println("Manual reconciliation requested via Web UI.")
+				appl.TriggerReconcile()
+			}
+		}
+		webUI.StatusProvider = func() map[string]any {
+			currentAppMu.RLock()
+			appl := currentApp
+			currentAppMu.RUnlock()
+
+			if appl == nil {
+				return nil
+			}
+			return appl.StatusPayload()
 		}
 
 		go func() {

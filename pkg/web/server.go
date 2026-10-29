@@ -58,6 +58,11 @@ type Server struct {
 	mu             sync.Mutex
 	OnConfigChange func()
 	OnSyncTrigger  func()
+	OnAlbumSync    func(url string)
+	OnReconcile    func()
+	// StatusProvider returns extra status fields (per-album runs, ledger
+	// counters, reconciliation settings) merged into /api/status.
+	StatusProvider func() map[string]any
 }
 
 func NewServer(configPath string) *Server {
@@ -73,6 +78,7 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/sync/status", s.handleStatus)
 	mux.HandleFunc("/api/sync", s.handleSync)
 	mux.HandleFunc("/sync_now", s.handleSync)
+	mux.HandleFunc("/api/reconcile", s.handleReconcile)
 
 	addr := fmt.Sprintf(":%d", port)
 	srv := &http.Server{
@@ -108,13 +114,34 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	if albumURL := r.URL.Query().Get("album"); albumURL != "" {
+		if s.OnAlbumSync != nil {
+			go s.OnAlbumSync(albumURL)
+		}
+		w.Write([]byte(`{"status":"ok","message":"Album sync triggered"}`))
+		return
+	}
+
 	if s.OnSyncTrigger != nil {
 		go s.OnSyncTrigger()
 	}
+	w.Write([]byte(`{"status":"ok","message":"Sync triggered"}`))
+}
 
+func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.OnReconcile != nil {
+		go s.OnReconcile()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok","message":"Sync triggered"}`))
+	w.Write([]byte(`{"status":"ok","message":"Reconciliation triggered"}`))
 }
 
 var cachedImmichUser string
@@ -169,13 +196,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		nextRunStr = nextRun.UTC().Format(time.RFC3339)
 	}
 
-	resp := map[string]interface{}{
+	resp := map[string]any{
 		"immichUser": userName,
 		"album":      album,
 		"processed":  processed,
 		"total":      total,
 		"lastRun":    lastRunStr,
 		"nextRun":    nextRunStr,
+	}
+
+	if s.StatusProvider != nil {
+		for key, value := range s.StatusProvider() {
+			resp[key] = value
+		}
 	}
 
 	json.NewEncoder(w).Encode(resp)
@@ -226,12 +259,31 @@ func (s *Server) saveConfig(w http.ResponseWriter, r *http.Request) {
 		existingMap = make(map[string]interface{})
 	}
 
+	// Keep fields the UI does not expose but that users may have set by hand.
+	var existingCfg config.Config
+	if len(existingContent) > 0 {
+		_ = json.Unmarshal(existingContent, &existingCfg)
+	}
+	for i := range newCfg.GooglePhotos {
+		if newCfg.GooglePhotos[i].ImmichAlbumID != "" {
+			continue
+		}
+		for _, old := range existingCfg.GooglePhotos {
+			if old.URL == newCfg.GooglePhotos[i].URL {
+				newCfg.GooglePhotos[i].ImmichAlbumID = old.ImmichAlbumID
+				break
+			}
+		}
+	}
+
 	// Update only fields exposed in UI
 	existingMap["apiURL"] = newCfg.ApiURL
 	existingMap["apiKey"] = newCfg.ApiKey
 	existingMap["workers"] = newCfg.Workers
 	existingMap["debug"] = newCfg.Debug
 	existingMap["googlePhotos"] = newCfg.GooglePhotos
+	existingMap["dedup"] = newCfg.Dedup
+	existingMap["reconcile"] = newCfg.Reconcile
 
 	// Prettify output
 	outBytes, err := json.MarshalIndent(existingMap, "", "    ")

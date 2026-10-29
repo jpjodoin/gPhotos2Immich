@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"warreth.dev/gphotos2immich/pkg/config"
 )
 
 func TestSaveConfig(t *testing.T) {
@@ -154,5 +157,63 @@ func TestHandleStatus(t *testing.T) {
 	bodyStr := w.Body.String()
 	if !strings.Contains(bodyStr, "immichUser") || !strings.Contains(bodyStr, "lastRun") || !strings.Contains(bodyStr, "nextRun") {
 		t.Fatalf("response missing expected fields: %s", bodyStr)
+	}
+}
+
+func TestSaveConfigPreservesFieldsTheUIHides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	initial := `{
+		"apiURL": "http://immich/api",
+		"apiKey": "key",
+		"dedup": {"mode": "smart", "windowSeconds": 42, "wideWindowHours": 24},
+		"reconcile": {"interval": "6h", "maxPerRun": 7},
+		"googlePhotos": [
+			{"url": "https://album/1", "albumName": "One", "syncInterval": "12h", "immichAlbumId": "uuid-1"}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(initial), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer(path)
+
+	// The web UI re-sends albums without the hidden immichAlbumId field and
+	// sends the dedup/reconcile blocks merged with what it loaded.
+	body := []byte(`{
+		"apiURL": "http://immich/api",
+		"apiKey": "key",
+		"dedup": {"mode": "smart", "dryRun": true, "windowSeconds": 42, "wideWindowHours": 24},
+		"reconcile": {"interval": "6h", "maxPerRun": 7, "deleteMatchedDuplicates": true},
+		"googlePhotos": [
+			{"url": "https://album/1", "albumName": "One", "syncInterval": "12h", "enabled": true}
+		]
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/config", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.handleConfig(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved config.Config
+	if err := json.Unmarshal(content, &saved); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(saved.GooglePhotos) != 1 || saved.GooglePhotos[0].ImmichAlbumID != "uuid-1" {
+		t.Fatalf("immichAlbumId was not preserved: %+v", saved.GooglePhotos)
+	}
+	if !saved.Dedup.DryRun || saved.Dedup.WindowSeconds != 42 {
+		t.Fatalf("dedup block lost fields: %+v", saved.Dedup)
+	}
+	if !saved.Reconcile.DeleteMatchedDuplicates || saved.Reconcile.Interval != "6h" {
+		t.Fatalf("reconcile block lost fields: %+v", saved.Reconcile)
 	}
 }
