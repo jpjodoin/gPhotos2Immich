@@ -6,16 +6,39 @@
   "albumWorkers": 3,
   "strictMetadata": false,
   "skipVideos": false,
+  "dataDir": "./data",
+  "dedup": {
+    "mode": "smart",
+    "dryRun": false,
+    "similarityThreshold": 14,
+    "ambiguityMargin": 4,
+    "windowSeconds": 3,
+    "wideWindowHours": 24,
+    "thumbnailWidth": 300
+  },
+  "reconcile": {
+    "enabled": true,
+    "interval": "1h",
+    "fullSweepInterval": "168h",
+    "maxPerRun": 200,
+    "maxDebtAge": "2160h",
+    "deleteMatchedDuplicates": false,
+    "retryBackoff": ["1h", "6h", "24h", "72h", "168h", "720h"],
+    "reportPath": "./data/dedup-report.csv",
+    "archivePath": "./data/dedup-ledger-archive.jsonl"
+  },
   "googlePhotos": [
     {
       "url": "https://photos.app.goo.gl/example-share-link-1",
       "albumName": "Summer Vacation 2023",
-      "syncInterval": "12h"
+      "syncInterval": "12h",
+      "enabled": true
     },
     {
       "url": "https://photos.app.goo.gl/example-share-link-2",
       "immichAlbumId": "existing-album-uuid-optional",
-      "syncInterval": "1h"
+      "syncInterval": "1d",
+      "enabled": false
     }
   ]
 }

@@ -236,23 +236,45 @@ func (r *Reconciler) resolveOne(ctx context.Context, e ledger.Entry, now time.Ti
 		return false
 	}
 
-	if !r.cfg.DryRun {
-		for _, albumID := range e.AlbumIDs {
-			if err := r.client.AddAssetsToAlbum(ctx, albumID, []string{res.AssetID}); err != nil {
-				r.logger.Warn("Failed to add original to album", "album_id", albumID, "error", err)
-			}
+	if r.cfg.DryRun {
+		// Keep the debt pending: turning dry-run off must still resolve it.
+		r.report(ReportRow{
+			Timestamp:       now,
+			Action:          "would_resolve",
+			AlbumURL:        e.AlbumURL,
+			GoogleItemID:    e.GoogleItemID,
+			GpFileName:      e.FileName,
+			GpAssetID:       e.GpAssetID,
+			ResolvedAssetID: res.AssetID,
+			Distance:        res.Distance,
+			Candidates:      len(res.Scored),
+			Note:            "dry run: nothing written",
+		})
+		r.logger.Info("Dry run: would reconcile duplicate",
+			"google_id", e.GoogleItemID,
+			"resolved_asset_id", res.AssetID,
+			"distance", res.Distance,
+			"albums", len(e.AlbumIDs),
+		)
+		r.reschedule(e.GoogleItemID, e.Checks, now)
+		return false
+	}
+
+	for _, albumID := range e.AlbumIDs {
+		if err := r.client.AddAssetsToAlbum(ctx, albumID, []string{res.AssetID}); err != nil {
+			r.logger.Warn("Failed to add original to album", "album_id", albumID, "error", err)
 		}
-		if r.cfg.DeleteMatchedDuplicates {
-			if err := r.client.DeleteAssets(ctx, []string{e.GpAssetID}, true); err != nil {
-				r.logger.Warn("Failed to delete duplicate, will retry", "asset_id", e.GpAssetID, "error", err)
-				r.reschedule(e.GoogleItemID, e.Checks, now)
-				return false
-			}
+	}
+	if r.cfg.DeleteMatchedDuplicates {
+		if err := r.client.DeleteAssets(ctx, []string{e.GpAssetID}, true); err != nil {
+			r.logger.Warn("Failed to delete duplicate, will retry", "asset_id", e.GpAssetID, "error", err)
+			r.reschedule(e.GoogleItemID, e.Checks, now)
+			return false
 		}
-		if e.StateKey != "" {
-			// Future syncs resolve the Google item straight to the original.
-			r.state.Set(e.StateKey, res.AssetID)
-		}
+	}
+	if e.StateKey != "" {
+		// Future syncs resolve the Google item straight to the original.
+		r.state.Set(e.StateKey, res.AssetID)
 	}
 
 	if err := r.ledger.Resolve(e.GoogleItemID, res.AssetID, now); err != nil {
@@ -283,9 +305,6 @@ func (r *Reconciler) resolveOne(ctx context.Context, e ledger.Entry, now time.Ti
 }
 
 func deleteNote(cfg Config) string {
-	if cfg.DryRun {
-		return "dry run: nothing written"
-	}
 	if cfg.DeleteMatchedDuplicates {
 		return "duplicate deleted"
 	}

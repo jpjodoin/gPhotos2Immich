@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,12 @@ func TestSaveConfig(t *testing.T) {
 }
 
 func TestSaveConfigPermissionError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Chmod-based read-only directories do not prevent writes on Windows,
+		// so this test cannot make the write fail.
+		t.Skip("read-only directory semantics differ on Windows")
+	}
+
 	// Create read-only directory
 	tmpDir := t.TempDir()
 	roDir := filepath.Join(tmpDir, "ro")
