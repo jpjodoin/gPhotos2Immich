@@ -24,6 +24,9 @@ type Asset struct {
 	FileCreatedAt    time.Time `json:"fileCreatedAt"`
 	UpdatedAt        time.Time `json:"updatedAt"`
 	IsTrashed        bool      `json:"isTrashed"`
+	// Visibility is "timeline", "hidden", "archive" or "locked". Hidden assets
+	// are the video component of motion photos and must never be reconciled.
+	Visibility string `json:"visibility"`
 }
 
 // IsVideo reports whether the asset is a video.

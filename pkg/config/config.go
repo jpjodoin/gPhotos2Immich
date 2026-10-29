@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"warreth.dev/gphotos2immich/pkg/duration"
@@ -61,6 +62,26 @@ func DefaultDedup() DedupConfig {
 	}
 }
 
+// ReconcileConfig controls the background pass that resolves duplicates
+// uploaded before the original was present in Immich.
+type ReconcileConfig struct {
+	// Enabled defaults to true.
+	Enabled                 *bool    `json:"enabled,omitempty"`
+	Interval                string   `json:"interval"`
+	FullSweepInterval       string   `json:"fullSweepInterval"`
+	MaxPerRun               int      `json:"maxPerRun"`
+	MaxDebtAge              string   `json:"maxDebtAge"`
+	DeleteMatchedDuplicates bool     `json:"deleteMatchedDuplicates"`
+	RetryBackoff            []string `json:"retryBackoff"`
+	ReportPath              string   `json:"reportPath"`
+	ArchivePath             string   `json:"archivePath"`
+}
+
+// IsEnabled reports whether reconciliation is enabled (absent means enabled).
+func (r ReconcileConfig) IsEnabled() bool {
+	return r.Enabled == nil || *r.Enabled
+}
+
 type Config struct {
 	ApiKey         string               `json:"apiKey"`
 	ApiURL         string               `json:"apiURL"`
@@ -72,6 +93,7 @@ type Config struct {
 	DataDir        string               `json:"dataDir"`        // Optional, directory for persistent state (default "./data")
 	GooglePhotos   []GooglePhotosConfig `json:"googlePhotos"`
 	Dedup          DedupConfig          `json:"dedup"`
+	Reconcile      ReconcileConfig      `json:"reconcile"`
 }
 
 func ReadConfig(path string) (*Config, error) {
@@ -149,6 +171,32 @@ func (c *Config) applyDefaults() {
 	if c.Dedup.ThumbnailWidth <= 0 {
 		c.Dedup.ThumbnailWidth = defaults.ThumbnailWidth
 	}
+
+	dataDir := c.DataDir
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+	if c.Reconcile.Interval == "" {
+		c.Reconcile.Interval = "1h"
+	}
+	if c.Reconcile.FullSweepInterval == "" {
+		c.Reconcile.FullSweepInterval = "168h"
+	}
+	if c.Reconcile.MaxDebtAge == "" {
+		c.Reconcile.MaxDebtAge = "2160h" // 90 days
+	}
+	if c.Reconcile.MaxPerRun <= 0 {
+		c.Reconcile.MaxPerRun = 200
+	}
+	if len(c.Reconcile.RetryBackoff) == 0 {
+		c.Reconcile.RetryBackoff = []string{"1h", "6h", "24h", "72h", "168h", "720h"}
+	}
+	if c.Reconcile.ReportPath == "" {
+		c.Reconcile.ReportPath = filepath.Join(dataDir, "dedup-report.csv")
+	}
+	if c.Reconcile.ArchivePath == "" {
+		c.Reconcile.ArchivePath = filepath.Join(dataDir, "dedup-ledger-archive.jsonl")
+	}
 }
 
 // Validate checks that all required config fields are present and valid
@@ -173,6 +221,23 @@ func (c *Config) Validate() error {
 	}
 	if c.Dedup.AmbiguityMargin < 0 || c.Dedup.AmbiguityMargin > 32 {
 		return fmt.Errorf("dedup.ambiguityMargin must be between 0 and 32")
+	}
+	for _, field := range []struct{ name, value string }{
+		{"reconcile.interval", c.Reconcile.Interval},
+		{"reconcile.fullSweepInterval", c.Reconcile.FullSweepInterval},
+		{"reconcile.maxDebtAge", c.Reconcile.MaxDebtAge},
+	} {
+		if field.value == "" {
+			continue
+		}
+		if _, err := duration.Parse(field.value); err != nil {
+			return fmt.Errorf("%s %q is invalid: %w", field.name, field.value, err)
+		}
+	}
+	for i, raw := range c.Reconcile.RetryBackoff {
+		if _, err := duration.Parse(raw); err != nil {
+			return fmt.Errorf("reconcile.retryBackoff[%d] %q is invalid: %w", i, raw, err)
+		}
 	}
 	for i, gp := range c.GooglePhotos {
 		if gp.URL == "" {

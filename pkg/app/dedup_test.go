@@ -2,17 +2,6 @@ package app
 
 import "testing"
 
-func TestIsOwnUpload(t *testing.T) {
-	if !isOwnUpload("gp_AF1Qip123.jpg") {
-		t.Fatal("gp_ prefix should be recognised as an own upload")
-	}
-	for _, name := range []string{"IMG_0001.JPG", "PXL_20230101.jpg", "", "GP_upper.jpg"} {
-		if isOwnUpload(name) {
-			t.Fatalf("%q should not be an own upload", name)
-		}
-	}
-}
-
 func TestDedupKey(t *testing.T) {
 	cases := map[string]string{
 		"IMG_0001.JPG":   "IMG_0001",
@@ -27,5 +16,16 @@ func TestDedupKey(t *testing.T) {
 		if got := dedupKey(in); got != want {
 			t.Fatalf("dedupKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestAppendUnique(t *testing.T) {
+	got := appendUnique([]string{"a", "b"}, "b")
+	if len(got) != 2 {
+		t.Fatalf("appendUnique duplicated an existing value: %v", got)
+	}
+	got = appendUnique(got, "c")
+	if len(got) != 3 || got[2] != "c" {
+		t.Fatalf("appendUnique did not append: %v", got)
 	}
 }

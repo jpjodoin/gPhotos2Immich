@@ -14,19 +14,25 @@ import (
 	"warreth.dev/gphotos2immich/pkg/duration"
 	"warreth.dev/gphotos2immich/pkg/googlephotos"
 	"warreth.dev/gphotos2immich/pkg/immich"
+	"warreth.dev/gphotos2immich/pkg/ledger"
 	"warreth.dev/gphotos2immich/pkg/match"
 	"warreth.dev/gphotos2immich/pkg/progress"
+	"warreth.dev/gphotos2immich/pkg/reconcile"
 	"warreth.dev/gphotos2immich/pkg/state"
 	"warreth.dev/gphotos2immich/pkg/util"
 )
 
 type App struct {
-	Cfg      *config.Config
-	Client   *immich.Client
-	GPClient *googlephotos.Client
-	Logger   *slog.Logger
-	State    *state.SyncState
-	syncCh   chan struct{}
+	Cfg         *config.Config
+	Client      *immich.Client
+	GPClient    *googlephotos.Client
+	Logger      *slog.Logger
+	State       *state.SyncState
+	Ledger      *ledger.Store
+	Reconciler  *reconcile.Reconciler
+	backoff     []time.Duration
+	syncCh      chan struct{}
+	reconcileCh chan struct{}
 }
 
 func New(cfg *config.Config) (*App, error) {
@@ -66,20 +72,78 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	logger.Info("Loaded persistent dedup state", "entries", syncState.Count())
 
+	ledgerStore, err := ledger.Open(filepath.Join(dataDir, "dedup-ledger.jsonl"))
+	if err != nil {
+		return nil, fmt.Errorf("open dedup ledger: %w", err)
+	}
+	logger.Info("Loaded dedup ledger", "entries", ledgerStore.Total())
+
+	backoff := parseBackoffs(cfg.Reconcile.RetryBackoff)
+	reconciler := reconcile.New(reconcile.Config{
+		Enabled:                 cfg.Reconcile.IsEnabled(),
+		Interval:                mustDuration(cfg.Reconcile.Interval),
+		FullSweepInterval:       mustDuration(cfg.Reconcile.FullSweepInterval),
+		MaxPerRun:               cfg.Reconcile.MaxPerRun,
+		MaxDebtAge:              mustDuration(cfg.Reconcile.MaxDebtAge),
+		Backoff:                 backoff,
+		DeleteMatchedDuplicates: cfg.Reconcile.DeleteMatchedDuplicates,
+		DryRun:                  cfg.Dedup.DryRun,
+		NarrowWindow:            time.Duration(cfg.Dedup.WindowSeconds) * time.Second,
+		WideWindow:              time.Duration(cfg.Dedup.WideWindowHours) * time.Hour,
+		MatchOptions:            matchOptions(cfg),
+		ArchivePath:             cfg.Reconcile.ArchivePath,
+		ReportPath:              cfg.Reconcile.ReportPath,
+	}, client, ledgerStore, syncState, logger)
+
 	return &App{
-		Cfg:      cfg,
-		Client:   client,
-		GPClient: gpClient,
-		Logger:   logger,
-		State:    syncState,
-		syncCh:   make(chan struct{}, 1),
+		Cfg:         cfg,
+		Client:      client,
+		GPClient:    gpClient,
+		Logger:      logger,
+		State:       syncState,
+		Ledger:      ledgerStore,
+		Reconciler:  reconciler,
+		backoff:     backoff,
+		syncCh:      make(chan struct{}, 1),
+		reconcileCh: make(chan struct{}, 1),
 	}, nil
+}
+
+func mustDuration(value string) time.Duration {
+	d, _ := duration.Parse(value)
+	return d
+}
+
+func parseBackoffs(values []string) []time.Duration {
+	out := make([]time.Duration, 0, len(values))
+	for _, value := range values {
+		out = append(out, mustDuration(value))
+	}
+	if len(out) == 0 {
+		out = append(out, time.Hour)
+	}
+	return out
+}
+
+func matchOptions(cfg *config.Config) match.Options {
+	return match.Options{
+		MaxDistance: cfg.Dedup.SimilarityThreshold,
+		MinMargin:   cfg.Dedup.AmbiguityMargin,
+	}
 }
 
 // TriggerSync requests an immediate sync of all albums outside the schedule
 func (a *App) TriggerSync() {
 	select {
 	case a.syncCh <- struct{}{}:
+	default:
+	}
+}
+
+// TriggerReconcile requests an immediate full reconciliation pass.
+func (a *App) TriggerReconcile() {
+	select {
+	case a.reconcileCh <- struct{}{}:
 	default:
 	}
 }
@@ -92,6 +156,8 @@ func (a *App) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to Immich: %w", err)
 	}
 	a.Logger.Info("Connected to Immich", "user_id", id, "name", name)
+
+	go a.Reconciler.Run(ctx, a.reconcileCh)
 
 	if len(a.Cfg.GooglePhotos) == 0 {
 		a.Logger.Warn("No albums configured")
@@ -125,6 +191,9 @@ func (a *App) Run(ctx context.Context) error {
 		earliest := time.Now().Add(24 * time.Hour)
 
 		for _, ac := range a.Cfg.GooglePhotos {
+			if !ac.IsEnabled() {
+				continue
+			}
 			if !time.Now().Before(nextRun[ac.URL]) {
 				due = append(due, ac)
 			} else if nextRun[ac.URL].Before(earliest) {
@@ -248,7 +317,7 @@ type processResult struct {
 	Candidates      []match.Scored
 }
 
-// resolveAlbumID finds or creates the Immich album for a given config entry.
+// resolveAlbumID finds or creates the Immich album for a given config entry
 func (a *App) resolveAlbumID(ctx context.Context, ac config.GooglePhotosConfig, albumTitle string, albumCache []immich.Album, logger *slog.Logger) string {
 	if ac.ImmichAlbumID != "" {
 		return ac.ImmichAlbumID
@@ -257,6 +326,10 @@ func (a *App) resolveAlbumID(ctx context.Context, ac config.GooglePhotosConfig, 
 		if album.AlbumName == albumTitle {
 			return album.Id
 		}
+	}
+	if a.Cfg.Dedup.DryRun {
+		logger.Info("Dry run: album would be created", "title", albumTitle)
+		return ""
 	}
 	logger.Info("Creating Immich album", "title", albumTitle)
 	newAlbum, err := a.Client.CreateAlbum(ctx, albumTitle)
@@ -349,7 +422,7 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				results <- a.processItem(ctx, p, albumTitle, ac.URL, existingFiles, globalAssets)
+				results <- a.processItem(ctx, p, albumTitle, ac.URL, albumId, existingFiles, globalAssets)
 			}
 		}()
 	}
@@ -458,23 +531,15 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 	)
 }
 
-// matchOptions maps the dedup configuration onto matcher options.
-func (a *App) matchOptions() match.Options {
-	return match.Options{
-		MaxDistance: a.Cfg.Dedup.SimilarityThreshold,
-		MinMargin:   a.Cfg.Dedup.AmbiguityMargin,
-	}
-}
-
 // tryMatch looks for the same media item already present in Immich.
 //
 // For images, a small rendition of the Google item is downloaded (a few KB)
 // and hashed; for videos, only dimensions are used. In both cases the search is
 // restricted to a tight timestamp window first, then widened if nothing is
 // found.
-func (a *App) tryMatch(ctx context.Context, p googlephotos.Photo) match.Result {
+func (a *App) tryMatch(ctx context.Context, p googlephotos.Photo) (match.Result, match.Fingerprint) {
 	if p.TakenAt.IsZero() {
-		return match.Result{Verdict: match.VerdictNoMatch}
+		return match.Result{Verdict: match.VerdictNoMatch}, match.Fingerprint{}
 	}
 
 	var fingerprint match.Fingerprint
@@ -484,84 +549,110 @@ func (a *App) tryMatch(ctx context.Context, p googlephotos.Photo) match.Result {
 		thumb, err := googlephotos.DownloadThumbnail(ctx, a.GPClient, p.URL, a.Cfg.Dedup.ThumbnailWidth)
 		if err != nil {
 			a.Logger.Debug("Thumbnail unavailable, skipping smart match", "google_id", p.ID, "error", err)
-			return match.Result{Verdict: match.VerdictNoMatch}
+			return match.Result{Verdict: match.VerdictNoMatch}, match.Fingerprint{}
 		}
 		fingerprint, err = match.FingerprintFromBytes(thumb, p.TakenAt)
 		if err != nil {
 			a.Logger.Debug("Cannot fingerprint item, skipping smart match", "google_id", p.ID, "error", err)
-			return match.Result{Verdict: match.VerdictNoMatch}
+			return match.Result{Verdict: match.VerdictNoMatch}, match.Fingerprint{}
 		}
 	}
 
 	candidates := a.findCandidates(ctx, fingerprint)
 	if len(candidates) == 0 {
-		return match.Result{Verdict: match.VerdictNoMatch}
+		return match.Result{Verdict: match.VerdictNoMatch}, fingerprint
 	}
 
-	return match.Decide(ctx, fingerprint, candidates, a.Client, a.matchOptions())
+	return match.Decide(ctx, fingerprint, candidates, a.Client, matchOptions(a.Cfg)), fingerprint
 }
-
-// maxWideCandidates bounds the fallback search: on a busy day the wide window
-// can return hundreds of assets, and comparing all of them is not worth it.
-const maxWideCandidates = 25
 
 // findCandidates returns plausible Immich assets, nearest in time first.
 func (a *App) findCandidates(ctx context.Context, fingerprint match.Fingerprint) []match.Candidate {
-	narrow := time.Duration(a.Cfg.Dedup.WindowSeconds) * time.Second
-	candidates := a.searchCandidates(ctx, fingerprint.TakenAt.Add(-narrow), fingerprint.TakenAt.Add(narrow), 50)
-	if len(candidates) > 0 {
-		return candidates
-	}
-	if a.Cfg.Dedup.WideWindowHours <= 0 {
-		return nil
-	}
-
-	wide := time.Duration(a.Cfg.Dedup.WideWindowHours) * time.Hour
-	candidates = a.searchCandidates(ctx, fingerprint.TakenAt.Add(-wide), fingerprint.TakenAt.Add(wide), 100)
-	if len(candidates) > maxWideCandidates {
-		a.Logger.Debug("Too many candidates in wide window, skipping match", "count", len(candidates))
-		return nil
-	}
-	return candidates
+	return reconcile.FindCandidates(
+		ctx,
+		a.Client,
+		fingerprint,
+		time.Duration(a.Cfg.Dedup.WindowSeconds)*time.Second,
+		time.Duration(a.Cfg.Dedup.WideWindowHours)*time.Hour,
+	)
 }
 
-// searchCandidates queries Immich for assets taken in the given window,
-// excluding trashed assets and the tool's own uploads.
-func (a *App) searchCandidates(ctx context.Context, from, to time.Time, limit int) []match.Candidate {
-	assets, err := a.Client.SearchMetadata(ctx, immich.SearchFilter{
-		TakenAfter:  from,
-		TakenBefore: to,
-		Size:        limit,
-	})
-	if err != nil {
-		a.Logger.Debug("Candidate search failed", "error", err)
-		return nil
+// rememberAlbum keeps the ledger in sync when an existing duplicate is reused
+// for another album, so a later resolution updates every album.
+func (a *App) rememberAlbum(googleItemID, albumID string) {
+	if a.Ledger == nil || googleItemID == "" || albumID == "" {
+		return
+	}
+	if err := a.Ledger.AddAlbum(googleItemID, albumID); err != nil {
+		a.Logger.Debug("Failed to record album membership", "google_id", googleItemID, "error", err)
+	}
+}
+
+// recordDebt stores the fingerprint of a freshly uploaded duplicate so the
+// reconciliation pass can find the original once it appears in Immich.
+func (a *App) recordDebt(p googlephotos.Photo, albumURL, stateKey, fileName, albumID string, fp match.Fingerprint, assetID string) {
+	if a.Ledger == nil || a.Cfg.Dedup.DryRun || a.Cfg.Dedup.Mode != "smart" {
+		return
+	}
+	if assetID == "" || albumID == "" {
+		return
 	}
 
-	candidates := make([]match.Candidate, 0, len(assets))
-	for _, asset := range assets {
-		if asset.IsTrashed || isOwnUpload(asset.OriginalFileName) {
-			continue
+	now := time.Now()
+	entry, exists := a.Ledger.Get(p.ID)
+	if !exists {
+		entry = ledger.Entry{
+			GoogleItemID: p.ID,
+			StateKey:     stateKey,
+			CreatedAt:    now,
 		}
-		candidates = append(candidates, match.Candidate{
-			ID:       asset.ID,
-			FileName: asset.OriginalFileName,
-			Width:    asset.Width,
-			Height:   asset.Height,
-			IsVideo:  asset.IsVideo(),
-			TakenAt:  asset.FileCreatedAt,
-		})
 	}
-	return candidates
+	entry.AlbumURL = albumURL
+	entry.AlbumIDs = appendUnique(entry.AlbumIDs, albumID)
+	entry.GpAssetID = assetID
+	entry.FileName = fileName
+	entry.TakenAt = p.TakenAt
+	entry.Width = fp.Width
+	entry.Height = fp.Height
+	entry.IsVideo = fp.IsVideo
+	entry.DHash = fp.DHash
+	entry.HasHash = fp.HasHash
+	entry.State = ledger.StatePending
+	entry.LastCheck = now
+	if entry.Checks == 0 {
+		entry.NextCheck = now.Add(a.backoff[0])
+	}
+
+	if err := a.Ledger.Upsert(entry); err != nil {
+		a.Logger.Warn("Failed to record dedup debt", "google_id", p.ID, "error", err)
+		return
+	}
+
+	if err := reconcile.AppendReport(a.Cfg.Reconcile.ReportPath, reconcile.ReportRow{
+		Timestamp:    now,
+		Action:       "created",
+		AlbumURL:     albumURL,
+		GoogleItemID: p.ID,
+		GpFileName:   fileName,
+		GpAssetID:    assetID,
+		Note:         "uploaded; waiting for the original to appear in Immich",
+	}); err != nil {
+		a.Logger.Debug("Failed to write dedup report", "error", err)
+	}
+
+	a.Logger.Debug("Recorded dedup debt", "google_id", p.ID, "asset_id", assetID)
 }
 
-// isOwnUpload reports whether the filename was generated by this tool. Those
-// copies must never win a match against a real user asset.
-func isOwnUpload(name string) bool {
-	return strings.HasPrefix(name, "gp_")
+func appendUnique(values []string, value string) []string {
+	for _, v := range values {
+		if v == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
-func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle, albumURL string, existingFiles map[string]string, globalAssets map[string]string) processResult {
+func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle, albumURL, albumId string, existingFiles map[string]string, globalAssets map[string]string) processResult {
 	safeId := strings.ReplaceAll(p.ID, "/", "_")
 	safeId = strings.ReplaceAll(safeId, ":", "_")
 	baseName := fmt.Sprintf("gp_%s", safeId)
@@ -574,12 +665,14 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 
 	if assetId, exists := globalAssets[baseName]; exists {
 		a.Logger.Debug("Asset exists in Immich (device search), adding to album", "id", assetId, "filename", baseName)
+		a.rememberAlbum(p.ID, albumId)
 		return processResult{ID: assetId, Action: ItemMatched}
 	}
 
 	// Persistent local state catches assets uploaded under a different deviceId/filename
 	if assetId, exists := a.State.Get(baseName); exists {
 		a.Logger.Debug("Asset found in persistent dedup cache", "id", assetId, "filename", baseName)
+		a.rememberAlbum(p.ID, albumId)
 		return processResult{ID: assetId, Action: ItemMatched}
 	}
 
@@ -597,8 +690,9 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 	// Smart dedup: recognise an asset that is already in Immich before
 	// downloading or uploading anything.
 	var matchRes match.Result
+	var fingerprint match.Fingerprint
 	if a.Cfg.Dedup.Mode == "smart" {
-		matchRes = a.tryMatch(ctx, p)
+		matchRes, fingerprint = a.tryMatch(ctx, p)
 
 		if matchRes.Verdict == match.VerdictMatch {
 			if !a.Cfg.Dedup.DryRun {
@@ -786,6 +880,7 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 				a.Logger.Debug("Motion photo deduplicated by Immich", "filename", filename, "id", uploadedId)
 				return processResult{ID: uploadedId, Action: ItemMatched, BytesDownloaded: bytesDownloaded, BytesUploaded: bytesUploaded}
 			}
+			a.recordDebt(p, albumURL, baseName, filename, albumId, fingerprint, uploadedId)
 			a.Logger.Debug("Uploaded motion photo", "filename", filename, "id", uploadedId)
 			return processResult{ID: uploadedId, Action: ItemUploaded, BytesDownloaded: bytesDownloaded, BytesUploaded: bytesUploaded}
 		}
@@ -810,6 +905,7 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 		return processResult{ID: uploadedId, Action: ItemMatched, BytesDownloaded: bytesDownloaded, BytesUploaded: bytesUploaded}
 	}
 
+	a.recordDebt(p, albumURL, baseName, filename, albumId, fingerprint, uploadedId)
 	a.Logger.Debug("Uploaded item", "filename", filename, "id", uploadedId)
 	return processResult{ID: uploadedId, Action: ItemUploaded, BytesDownloaded: bytesDownloaded, BytesUploaded: bytesUploaded}
 }
