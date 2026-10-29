@@ -140,21 +140,19 @@ func TestHandleSync(t *testing.T) {
 }
 func TestHandleStatus(t *testing.T) {
 	s := NewServer("dummy.json")
-	
+
 	req := httptest.NewRequest(http.MethodGet, "/sync/status", nil)
 	w := httptest.NewRecorder()
-	
+
 	s.handleStatus(w, req)
-	
+
 	resp := w.Result()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK on /sync/status, got %d", resp.StatusCode)
 	}
-	
+
 	bodyStr := w.Body.String()
 	if !strings.Contains(bodyStr, "immichUser") || !strings.Contains(bodyStr, "lastRun") || !strings.Contains(bodyStr, "nextRun") {
 		t.Fatalf("response missing expected fields: %s", bodyStr)
 	}
 }
-
-

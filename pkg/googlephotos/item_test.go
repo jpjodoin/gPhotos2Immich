@@ -174,7 +174,7 @@ func TestDownloadItemMediaPlainImage(t *testing.T) {
 }
 
 // If the album metadata says video but =dv serves nothing usable, the item
-	// must fail loudly instead of silently uploading a poster frame.
+// must fail loudly instead of silently uploading a poster frame.
 func TestDownloadItemMediaVideoItemWithoutStream(t *testing.T) {
 	client := newTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

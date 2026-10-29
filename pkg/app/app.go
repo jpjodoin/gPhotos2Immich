@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"warreth.dev/gphotos2immich/pkg/config"
+	"warreth.dev/gphotos2immich/pkg/duration"
 	"warreth.dev/gphotos2immich/pkg/googlephotos"
 	"warreth.dev/gphotos2immich/pkg/immich"
+	"warreth.dev/gphotos2immich/pkg/match"
 	"warreth.dev/gphotos2immich/pkg/progress"
 	"warreth.dev/gphotos2immich/pkg/state"
 	"warreth.dev/gphotos2immich/pkg/util"
@@ -164,7 +166,7 @@ func (a *App) Run(ctx context.Context) error {
 			nowCompleted := time.Now()
 			nextEarliest := nowCompleted.Add(24 * time.Hour)
 			for _, ac := range due {
-				interval, err := time.ParseDuration(ac.SyncInterval)
+				interval, err := duration.Parse(ac.SyncInterval)
 				if err != nil || interval == 0 {
 					interval = 24 * time.Hour
 				}
@@ -202,15 +204,51 @@ func (a *App) Run(ctx context.Context) error {
 	}
 }
 
+// ItemAction describes what happened to a Google Photos item.
+type ItemAction int
+
+const (
+	// ItemMatched means an existing Immich asset was found; nothing was uploaded.
+	ItemMatched ItemAction = iota
+	// ItemUploaded means the item was uploaded as a new asset.
+	ItemUploaded
+	// ItemWouldUpload is a dry-run outcome: the item would have been uploaded.
+	ItemWouldUpload
+	// ItemSkipped means the item was already handled or deliberately skipped.
+	ItemSkipped
+	// ItemFailed means processing the item returned an error.
+	ItemFailed
+)
+
+func (a ItemAction) String() string {
+	switch a {
+	case ItemMatched:
+		return "matched"
+	case ItemUploaded:
+		return "uploaded"
+	case ItemWouldUpload:
+		return "would_upload"
+	case ItemSkipped:
+		return "skipped"
+	case ItemFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
 type processResult struct {
 	ID              string
-	WasUploaded     bool
+	Action          ItemAction
 	Error           error
 	BytesDownloaded int64
 	BytesUploaded   int64
+	Distance        int
+	Ambiguous       bool
+	Candidates      []match.Scored
 }
 
-// resolveAlbumID finds or creates the Immich album for a given config entry
+// resolveAlbumID finds or creates the Immich album for a given config entry.
 func (a *App) resolveAlbumID(ctx context.Context, ac config.GooglePhotosConfig, albumTitle string, albumCache []immich.Album, logger *slog.Logger) string {
 	if ac.ImmichAlbumID != "" {
 		return ac.ImmichAlbumID
@@ -229,28 +267,28 @@ func (a *App) resolveAlbumID(ctx context.Context, ac config.GooglePhotosConfig, 
 	return newAlbum.Id
 }
 
-// prefetchAlbumAssets fetches existing asset names from an Immich album for deduplication
+// dedupKey normalises a filename the same way uploads are named, so an asset
+// can be recognised across runs.
+func dedupKey(name string) string {
+	if util.IsVideoFilename(name) {
+		return name
+	}
+	return util.StripExtension(name)
+}
+
+// prefetchAlbumAssets returns the album's existing assets keyed by dedup key.
 func (a *App) prefetchAlbumAssets(ctx context.Context, albumId string, logger *slog.Logger) map[string]string {
 	existingFiles := make(map[string]string)
 	if albumId == "" {
 		return existingFiles
 	}
-	albumDetails, err := a.Client.GetAlbum(ctx, albumId)
+	assets, err := a.Client.AlbumAssets(ctx, albumId)
 	if err != nil {
-		logger.Warn("Failed to fetch album details", "error", err)
+		logger.Warn("Failed to fetch album assets", "error", err)
 		return existingFiles
 	}
-	for _, asset := range albumDetails.Assets {
-		var name string
-		if util.IsVideoFilename(asset.OriginalFileName) {
-			// For videos, use full filename to avoid colliding with image basenames
-			// (especially motion photo containers like "photo.mp.jpg")
-			name = asset.OriginalFileName
-		} else {
-			// For images, use basename without extension (existing behavior)
-			name = util.StripExtension(asset.OriginalFileName)
-		}
-		existingFiles[name] = asset.Id
+	for _, asset := range assets {
+		existingFiles[dedupKey(asset.OriginalFileName)] = asset.ID
 	}
 	logger.Debug("Pre-fetched album assets", "count", len(existingFiles))
 	return existingFiles
@@ -283,12 +321,10 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 	logger.Debug("Dedup cache loaded", "album_assets", len(existingFiles), "global_assets", len(globalAssets))
 
 	var newAssetIds []string
+	var matched, uploaded, wouldUpload, skipped, failed, ambiguous int
 
 	total := len(album.Photos)
 	processed := 0
-	added := 0
-	skipped := 0
-	failed := 0
 
 	numWorkers := a.Cfg.Workers
 	if numWorkers < 1 {
@@ -313,8 +349,7 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				id, uploaded, bytesDown, bytesUp, err := a.processItem(ctx, p, albumTitle, ac.URL, existingFiles, globalAssets)
-				results <- processResult{ID: id, WasUploaded: uploaded, Error: err, BytesDownloaded: bytesDown, BytesUploaded: bytesUp}
+				results <- a.processItem(ctx, p, albumTitle, ac.URL, existingFiles, globalAssets)
 			}
 		}()
 	}
@@ -337,41 +372,49 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 		close(results)
 	}()
 
-	// Stream results, flushing new assets to album every 10%
 	flushInterval := total / 10
 	if flushInterval < 1 {
 		flushInterval = 1
 	}
 	lastFlushCount := 0
+	canWrite := albumId != "" && !a.Cfg.Dedup.DryRun
 
 	for res := range results {
 		processed++
-		wasFailed := false
-		wasSkipped := false
-		wasAdded := false
 
+		switch res.Action {
+		case ItemMatched:
+			matched++
+		case ItemUploaded:
+			uploaded++
+		case ItemWouldUpload:
+			wouldUpload++
+		case ItemSkipped:
+			skipped++
+		case ItemFailed:
+			failed++
+		}
+		if res.Ambiguous {
+			ambiguous++
+		}
 		if res.Error != nil {
 			logger.Error("Failed to process item", "error", res.Error)
-			failed++
-			wasFailed = true
-		} else {
-			if res.WasUploaded {
-				added++
-				wasAdded = true
-			} else {
-				skipped++
-				wasSkipped = true
-			}
-			if res.ID != "" {
-				newAssetIds = append(newAssetIds, res.ID)
-			}
 		}
 
-		// Update progress tracker
-		tracker.RecordItem(res.BytesDownloaded, res.BytesUploaded, wasAdded, wasSkipped, wasFailed)
+		if (res.Action == ItemUploaded || res.Action == ItemMatched) && res.ID != "" {
+			newAssetIds = append(newAssetIds, res.ID)
+		}
 
-		// Flush new assets to album periodically for incremental progress
-		if albumId != "" && len(newAssetIds) > lastFlushCount && processed%flushInterval == 0 {
+		tracker.RecordItem(
+			res.BytesDownloaded,
+			res.BytesUploaded,
+			res.Action == ItemUploaded,
+			res.Action == ItemMatched || res.Action == ItemSkipped || res.Action == ItemWouldUpload,
+			res.Action == ItemFailed || res.Error != nil,
+		)
+
+		// Flush new assets to album periodically for incremental progress.
+		if canWrite && len(newAssetIds) > lastFlushCount && processed%flushInterval == 0 {
 			batch := newAssetIds[lastFlushCount:]
 			lastFlushCount = len(newAssetIds)
 			logger.Debug("Adding assets to album (incremental)", "count", len(batch), "progress", fmt.Sprintf("%d/%d", processed, total))
@@ -380,34 +423,145 @@ func (a *App) processAlbum(ctx context.Context, ac config.GooglePhotosConfig, al
 			}
 		}
 
-		// Log progress every 100 items in debug mode
 		if a.Cfg.Debug && processed%100 == 0 {
-			logger.Debug("Progress", "processed", processed, "total", total, "added", added, "skipped", skipped, "failed", failed)
+			logger.Debug("Progress", "processed", processed, "total", total, "matched", matched, "uploaded", uploaded, "skipped", skipped, "failed", failed)
 		}
 	}
 
-	// Stop tracker and print final summary
 	tracker.Stop()
 
-	// Final flush: add remaining unflushed assets to album
-	if albumId != "" && len(newAssetIds) > lastFlushCount {
+	// Final flush: add remaining unflushed assets to album.
+	if canWrite && len(newAssetIds) > lastFlushCount {
 		remaining := newAssetIds[lastFlushCount:]
 		logger.Debug("Finalizing album assets", "count", len(remaining), "album", albumTitle)
 		if err := a.Client.AddAssetsToAlbum(ctx, albumId, remaining); err != nil {
 			logger.Error("Error adding assets to album", "error", err)
 		}
 	}
-	if a.Cfg.Debug {
-		logger.Info("Sync finished", "added", added, "skipped", skipped, "failed", failed, "total", processed)
+
+	// Persist dedup state to disk after each album.
+	if !a.Cfg.Dedup.DryRun {
+		if err := a.State.Save(); err != nil {
+			logger.Warn("Failed to save dedup state", "error", err)
+		}
 	}
 
-	// Persist dedup state to disk after each album
-	if err := a.State.Save(); err != nil {
-		logger.Warn("Failed to save dedup state", "error", err)
+	logger.Info("Album sync finished",
+		"total", processed,
+		"matched", matched,
+		"uploaded", uploaded,
+		"would_upload", wouldUpload,
+		"skipped", skipped,
+		"failed", failed,
+		"ambiguous", ambiguous,
+		"dry_run", a.Cfg.Dedup.DryRun,
+	)
+}
+
+// matchOptions maps the dedup configuration onto matcher options.
+func (a *App) matchOptions() match.Options {
+	return match.Options{
+		MaxDistance: a.Cfg.Dedup.SimilarityThreshold,
+		MinMargin:   a.Cfg.Dedup.AmbiguityMargin,
 	}
 }
 
-func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle, albumURL string, existingFiles map[string]string, globalAssets map[string]string) (string, bool, int64, int64, error) {
+// tryMatch looks for the same media item already present in Immich.
+//
+// For images, a small rendition of the Google item is downloaded (a few KB)
+// and hashed; for videos, only dimensions are used. In both cases the search is
+// restricted to a tight timestamp window first, then widened if nothing is
+// found.
+func (a *App) tryMatch(ctx context.Context, p googlephotos.Photo) match.Result {
+	if p.TakenAt.IsZero() {
+		return match.Result{Verdict: match.VerdictNoMatch}
+	}
+
+	var fingerprint match.Fingerprint
+	if p.IsVideo {
+		fingerprint = match.FingerprintForVideo(p.Width, p.Height, p.TakenAt)
+	} else {
+		thumb, err := googlephotos.DownloadThumbnail(ctx, a.GPClient, p.URL, a.Cfg.Dedup.ThumbnailWidth)
+		if err != nil {
+			a.Logger.Debug("Thumbnail unavailable, skipping smart match", "google_id", p.ID, "error", err)
+			return match.Result{Verdict: match.VerdictNoMatch}
+		}
+		fingerprint, err = match.FingerprintFromBytes(thumb, p.TakenAt)
+		if err != nil {
+			a.Logger.Debug("Cannot fingerprint item, skipping smart match", "google_id", p.ID, "error", err)
+			return match.Result{Verdict: match.VerdictNoMatch}
+		}
+	}
+
+	candidates := a.findCandidates(ctx, fingerprint)
+	if len(candidates) == 0 {
+		return match.Result{Verdict: match.VerdictNoMatch}
+	}
+
+	return match.Decide(ctx, fingerprint, candidates, a.Client, a.matchOptions())
+}
+
+// maxWideCandidates bounds the fallback search: on a busy day the wide window
+// can return hundreds of assets, and comparing all of them is not worth it.
+const maxWideCandidates = 25
+
+// findCandidates returns plausible Immich assets, nearest in time first.
+func (a *App) findCandidates(ctx context.Context, fingerprint match.Fingerprint) []match.Candidate {
+	narrow := time.Duration(a.Cfg.Dedup.WindowSeconds) * time.Second
+	candidates := a.searchCandidates(ctx, fingerprint.TakenAt.Add(-narrow), fingerprint.TakenAt.Add(narrow), 50)
+	if len(candidates) > 0 {
+		return candidates
+	}
+	if a.Cfg.Dedup.WideWindowHours <= 0 {
+		return nil
+	}
+
+	wide := time.Duration(a.Cfg.Dedup.WideWindowHours) * time.Hour
+	candidates = a.searchCandidates(ctx, fingerprint.TakenAt.Add(-wide), fingerprint.TakenAt.Add(wide), 100)
+	if len(candidates) > maxWideCandidates {
+		a.Logger.Debug("Too many candidates in wide window, skipping match", "count", len(candidates))
+		return nil
+	}
+	return candidates
+}
+
+// searchCandidates queries Immich for assets taken in the given window,
+// excluding trashed assets and the tool's own uploads.
+func (a *App) searchCandidates(ctx context.Context, from, to time.Time, limit int) []match.Candidate {
+	assets, err := a.Client.SearchMetadata(ctx, immich.SearchFilter{
+		TakenAfter:  from,
+		TakenBefore: to,
+		Size:        limit,
+	})
+	if err != nil {
+		a.Logger.Debug("Candidate search failed", "error", err)
+		return nil
+	}
+
+	candidates := make([]match.Candidate, 0, len(assets))
+	for _, asset := range assets {
+		if asset.IsTrashed || isOwnUpload(asset.OriginalFileName) {
+			continue
+		}
+		candidates = append(candidates, match.Candidate{
+			ID:       asset.ID,
+			FileName: asset.OriginalFileName,
+			Width:    asset.Width,
+			Height:   asset.Height,
+			IsVideo:  asset.IsVideo(),
+			TakenAt:  asset.FileCreatedAt,
+		})
+	}
+	return candidates
+}
+
+// isOwnUpload reports whether the filename was generated by this tool. Those
+// copies must never win a match against a real user asset.
+func isOwnUpload(name string) bool {
+	return strings.HasPrefix(name, "gp_")
+}
+
+func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle, albumURL string, existingFiles map[string]string, globalAssets map[string]string) processResult {
 	safeId := strings.ReplaceAll(p.ID, "/", "_")
 	safeId = strings.ReplaceAll(safeId, ":", "_")
 	baseName := fmt.Sprintf("gp_%s", safeId)
@@ -415,18 +569,78 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 	// Dedup checks against Immich (album-level, global device search, and persistent state)
 	if assetId, exists := existingFiles[baseName]; exists {
 		a.Logger.Debug("Asset already in album (Immich album lookup)", "id", assetId, "filename", baseName)
-		return "", false, 0, 0, nil
+		return processResult{Action: ItemSkipped}
 	}
 
 	if assetId, exists := globalAssets[baseName]; exists {
 		a.Logger.Debug("Asset exists in Immich (device search), adding to album", "id", assetId, "filename", baseName)
-		return assetId, false, 0, 0, nil
+		return processResult{ID: assetId, Action: ItemMatched}
 	}
 
 	// Persistent local state catches assets uploaded under a different deviceId/filename
 	if assetId, exists := a.State.Get(baseName); exists {
 		a.Logger.Debug("Asset found in persistent dedup cache", "id", assetId, "filename", baseName)
-		return assetId, false, 0, 0, nil
+		return processResult{ID: assetId, Action: ItemMatched}
+	}
+
+	if a.Cfg.StrictMetadata && p.TakenAt.IsZero() {
+		a.Logger.Warn("Skipping item with missing metadata date",
+			"id", p.ID, "url", p.URL)
+		return processResult{Action: ItemSkipped}
+	}
+
+	if p.IsVideo && a.Cfg.SkipVideos {
+		a.Logger.Debug("Skipping video item", "id", p.ID)
+		return processResult{Action: ItemSkipped}
+	}
+
+	// Smart dedup: recognise an asset that is already in Immich before
+	// downloading or uploading anything.
+	var matchRes match.Result
+	if a.Cfg.Dedup.Mode == "smart" {
+		matchRes = a.tryMatch(ctx, p)
+
+		if matchRes.Verdict == match.VerdictMatch {
+			if !a.Cfg.Dedup.DryRun {
+				a.State.Set(baseName, matchRes.AssetID)
+			}
+			a.Logger.Info("Matched an existing Immich asset, no upload",
+				"google_id", p.ID,
+				"asset_id", matchRes.AssetID,
+				"distance", matchRes.Distance,
+			)
+			return processResult{
+				ID:         matchRes.AssetID,
+				Action:     ItemMatched,
+				Distance:   matchRes.Distance,
+				Candidates: matchRes.Scored,
+			}
+		}
+
+		if matchRes.Verdict == match.VerdictAmbiguous {
+			// Conservative choice: keep a duplicate and let the reconciliation
+			// pass resolve it later. Never guess an album assignment.
+			a.Logger.Warn("Ambiguous match: keeping a duplicate for reconciliation",
+				"google_id", p.ID,
+				"best_distance", matchRes.Distance,
+				"second_distance", matchRes.SecondDistance,
+				"candidates", len(matchRes.Scored),
+			)
+		}
+	}
+
+	if a.Cfg.Dedup.DryRun {
+		a.Logger.Info("Dry run: item would be uploaded",
+			"google_id", p.ID,
+			"filename", baseName,
+			"verdict", string(matchRes.Verdict),
+		)
+		return processResult{
+			Action:     ItemWouldUpload,
+			Distance:   matchRes.Distance,
+			Ambiguous:  matchRes.Verdict == match.VerdictAmbiguous,
+			Candidates: matchRes.Scored,
+		}
 	}
 
 	a.Logger.Debug("Asset not found in dedup, will download",
@@ -434,16 +648,10 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 		"gp_item_id", p.ID,
 	)
 
-	if a.Cfg.StrictMetadata && p.TakenAt.IsZero() {
-		a.Logger.Warn("Skipping item with missing metadata date",
-			"id", p.ID, "url", p.URL)
-		return "", false, 0, 0, nil
-	}
-
 	a.Logger.Debug("Downloading item", "id", safeId)
 	media, err := googlephotos.DownloadItemMedia(ctx, a.GPClient, p)
 	if err != nil {
-		return "", false, 0, 0, fmt.Errorf("error downloading item: %w", err)
+		return processResult{Action: ItemFailed, Error: fmt.Errorf("error downloading item: %w", err)}
 	}
 	data, ext, isVideo := media.Data, media.Ext, media.Kind == "video"
 
@@ -457,17 +665,12 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 		filename := baseName + ext
 		if assetId, exists := existingFiles[filename]; exists {
 			a.Logger.Debug("Video already in album (album-level dedup by filename)", "id", assetId, "filename", filename)
-			return "", false, bytesDownloaded, 0, nil
+			return processResult{Action: ItemSkipped, BytesDownloaded: bytesDownloaded}
 		}
 		if assetId, exists := globalAssets[filename]; exists {
 			a.Logger.Debug("Video exists in Immich (device search by filename), adding to album", "id", assetId, "filename", filename)
-			return assetId, false, bytesDownloaded, 0, nil
+			return processResult{ID: assetId, Action: ItemMatched, BytesDownloaded: bytesDownloaded}
 		}
-	}
-
-	if isVideo && a.Cfg.SkipVideos {
-		a.Logger.Debug("Skipping video item", "id", p.ID)
-		return "", false, bytesDownloaded, 0, nil
 	}
 
 	filename := baseName + ext
@@ -561,10 +764,10 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 					imageData, filename, p.TakenAt, description)
 			}
 			if err != nil {
-				return "", false, bytesDownloaded, 0, fmt.Errorf("error uploading %s: %w", filename, err)
+				return processResult{Action: ItemFailed, Error: fmt.Errorf("error uploading %s: %w", filename, err), BytesDownloaded: bytesDownloaded}
 			}
 			if uploadedId == "" {
-				return "", false, bytesDownloaded, 0, fmt.Errorf("upload returned empty ID for %s", filename)
+				return processResult{Action: ItemFailed, Error: fmt.Errorf("upload returned empty ID for %s", filename), BytesDownloaded: bytesDownloaded}
 			}
 			// Only apply the live photo link for deduplicated assets, since UploadAssetWithLive
 			// already applied it during the initial upload
@@ -581,10 +784,10 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 			a.State.Set(baseName, uploadedId)
 			if isDup {
 				a.Logger.Debug("Motion photo deduplicated by Immich", "filename", filename, "id", uploadedId)
-				return uploadedId, false, bytesDownloaded, bytesUploaded, nil
+				return processResult{ID: uploadedId, Action: ItemMatched, BytesDownloaded: bytesDownloaded, BytesUploaded: bytesUploaded}
 			}
 			a.Logger.Debug("Uploaded motion photo", "filename", filename, "id", uploadedId)
-			return uploadedId, true, bytesDownloaded, bytesUploaded, nil
+			return processResult{ID: uploadedId, Action: ItemUploaded, BytesDownloaded: bytesDownloaded, BytesUploaded: bytesUploaded}
 		}
 
 		// Not a motion photo
@@ -593,10 +796,10 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 
 	uploadedId, isDup, err := a.Client.UploadAsset(ctx, data, filename, p.TakenAt, description)
 	if err != nil {
-		return "", false, bytesDownloaded, 0, fmt.Errorf("error uploading %s: %w", filename, err)
+		return processResult{Action: ItemFailed, Error: fmt.Errorf("error uploading %s: %w", filename, err), BytesDownloaded: bytesDownloaded}
 	}
 	if uploadedId == "" {
-		return "", false, bytesDownloaded, 0, fmt.Errorf("upload returned empty ID for %s", filename)
+		return processResult{Action: ItemFailed, Error: fmt.Errorf("upload returned empty ID for %s", filename), BytesDownloaded: bytesDownloaded}
 	}
 
 	bytesUploaded := int64(len(data))
@@ -604,9 +807,9 @@ func (a *App) processItem(ctx context.Context, p googlephotos.Photo, albumTitle,
 
 	if isDup {
 		a.Logger.Debug("Asset deduplicated by Immich", "filename", filename, "id", uploadedId)
-		return uploadedId, false, bytesDownloaded, bytesUploaded, nil
+		return processResult{ID: uploadedId, Action: ItemMatched, BytesDownloaded: bytesDownloaded, BytesUploaded: bytesUploaded}
 	}
 
 	a.Logger.Debug("Uploaded item", "filename", filename, "id", uploadedId)
-	return uploadedId, true, bytesDownloaded, bytesUploaded, nil
+	return processResult{ID: uploadedId, Action: ItemUploaded, BytesDownloaded: bytesDownloaded, BytesUploaded: bytesUploaded}
 }

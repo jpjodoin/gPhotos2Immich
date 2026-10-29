@@ -31,7 +31,7 @@ func (l *LogBuffer) Write(p []byte) (n int, err error) {
 	defer l.mu.Unlock()
 	// write to original os.Stdout
 	originalStdout.Write(p)
-	
+
 	l.buf.Write(p)
 	if l.buf.Len() > maxLogSize {
 		// simple truncation: drop first half
